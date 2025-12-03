@@ -1,0 +1,38 @@
+# Ignore node modules
+node_modules/
+
+# Ignore dist folder
+dist/
+
+# Ignore environment files (but keep .env.example)
+.env
+.env.local
+.env.*.local
+
+# Ignore Rust build artifacts
+target/
+Cargo.lock
+
+# Ignore data directories
+data/uploads/*
+data/compressed/*
+
+# Keep .gitkeep in data directories
+!data/uploads/.gitkeep
+!data/compressed/.gitkeep
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
