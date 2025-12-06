@@ -9,6 +9,20 @@
       <!-- Upload Component -->
       <FileUpload @filesAdded="handleFilesAdded" />
 
+      <!-- Tambahan kecil: pilihan mode single / multi-thread (Rayon) -->
+      <div class="flex justify-end items-center mt-4 mb-2 text-sm text-slate-700">
+        <label class="flex items-center gap-2">
+          <span>Mode kompresi:</span>
+          <select
+            v-model="mode"
+            class="border border-slate-300 rounded-md px-2 py-1 text-sm bg-white"
+          >
+            <option value="rayon">Multi-thread (Rayon)</option>
+            <option value="single">Single-thread</option>
+          </select>
+        </label>
+      </div>
+
       <!-- File Table Component -->
       <FileTable 
         :files="fileList"
@@ -17,6 +31,21 @@
         @download="downloadFile"
         @remove="removeFile"
       />
+
+      <!-- Ringkasan waktu kompres total -->
+      <div
+        v-if="totalDuration !== null"
+        class="mt-3 mb-2 text-right text-xs text-slate-700"
+      >
+        <span>
+          Total waktu kompres
+          ({{ lastModeUsed === 'rayon' ? 'Multi-thread (Rayon)' : 'Single-thread' }},
+          {{ lastSuccessCount }} file):
+        </span>
+        <span class="font-semibold">
+          {{ totalDuration.toFixed(3) }} detik
+        </span>
+      </div>
 
       <!-- Progress Component -->
       <ProgressList :progressItems="compressionProgress" />
@@ -42,15 +71,20 @@ export default {
     const fileList = ref([])
     const isProcessing = ref(false)
     const compressionProgress = ref([])
+    const mode = ref('rayon') // 'rayon' | 'single'
+
+    // untuk perbandingan single vs multi
+    const totalDuration = ref(null)      // dalam detik (number | null)
+    const lastModeUsed = ref(null)       // 'rayon' | 'single' | null
+    const lastSuccessCount = ref(0)      // jumlah file yang berhasil dikompres
 
     const handleFilesAdded = (files) => {
-      // Add files with initial status and ensure size property is preserved
       const newFiles = files.map(file => ({
         name: file.name,
         size: file.size,
         type: file.type,
         lastModified: file.lastModified,
-        file: file, // Keep reference to original File object
+        file: file,
         status: null,
         downloadUrl: null
       }))
@@ -66,7 +100,6 @@ export default {
 
       isProcessing.value = true
       
-      // Initialize progress for all files
       compressionProgress.value = fileList.value.map(file => ({
         fileName: file.name,
         status: 'queued',
@@ -76,19 +109,21 @@ export default {
         error: null
       }))
 
-      // Update file list with queued status
       fileList.value = fileList.value.map(file => ({
         ...file,
         status: 'queued'
       }))
 
       try {
-        // Call API service with original File objects
         const originalFiles = fileList.value.map(item => item.file)
+        console.log('compressFiles mode =', mode.value)
+
+        const startedAt = performance.now()
+
         await compressMultiplePDFs(
           originalFiles,
+          mode.value, // 'rayon' atau 'single'
           (index, progress, status, stats, downloadUrl, error) => {
-            // Update progress
             if (index >= 0 && index < compressionProgress.value.length) {
               compressionProgress.value[index] = {
                 ...compressionProgress.value[index],
@@ -99,7 +134,6 @@ export default {
                 error
               }
               
-              // Update file list status
               if (index < fileList.value.length) {
                 fileList.value[index] = {
                   ...fileList.value[index],
@@ -110,6 +144,15 @@ export default {
             }
           }
         )
+
+        const elapsedMs = performance.now() - startedAt
+        const successCount = compressionProgress.value.filter(
+          item => item.status === 'completed'
+        ).length
+
+        totalDuration.value = elapsedMs / 1000
+        lastModeUsed.value = mode.value
+        lastSuccessCount.value = successCount
       } catch (error) {
         console.error('Error during compression:', error)
         alert('Terjadi kesalahan saat kompresi: ' + error.message)
@@ -133,6 +176,10 @@ export default {
       fileList,
       isProcessing,
       compressionProgress,
+      mode,
+      totalDuration,
+      lastModeUsed,
+      lastSuccessCount,
       handleFilesAdded,
       removeFile,
       compressFiles,

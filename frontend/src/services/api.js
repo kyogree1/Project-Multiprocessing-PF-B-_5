@@ -1,110 +1,71 @@
 // Konfigurasi backend URL dari environment variable
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000'
+console.log('BACKEND_URL =', BACKEND_URL)
 
 /**
- * Poll job status sampai selesai
- */
-async function pollJobStatus(jobId, index, onProgress) {
-  const maxAttempts = 120 // 2 menit max (120 x 1 detik)
-  let attempts = 0
-  
-  while (attempts < maxAttempts) {
-    const response = await fetch(`${BACKEND_URL}/jobs/${jobId}`)
-    
-    if (!response.ok) {
-      throw new Error(`Failed to get job status: ${response.status}`)
-    }
-    
-    const jobData = await response.json()
-    
-    // Update progress based on status
-    if (jobData.status === 'pending') {
-      onProgress(index, 60, 'processing', null, null, null)
-    } else if (jobData.status === 'processing') {
-      onProgress(index, 75, 'processing', null, null, null)
-    } else if (jobData.status === 'done') {
-      onProgress(index, 95, 'processing', null, null, null)
-      return jobData
-    } else if (jobData.status === 'error') {
-      throw new Error('Job processing failed on server')
-    }
-    
-    // Wait 1 second before next poll
-    await new Promise(resolve => setTimeout(resolve, 1000))
-    attempts++
-  }
-  
-  throw new Error('Job processing timeout')
-}
-
-/**
- * Kompres multiple PDF secara paralel menggunakan backend
+ * Kompres multiple PDF dalam satu request.
+ *
  * @param {File[]} files - Array file PDF
- * @param {Function} onProgress - Callback: (index, progress, status, stats, downloadUrl, error)
+ * @param {'single'|'rayon'} mode - mode kompresi
+ * @param {Function} onProgress - (index, progress, status, stats, downloadUrl, error)
  */
-export async function compressMultiplePDFs(files, onProgress) {
-  const compressionPromises = files.map((file, index) => 
-    compressSinglePDF(file, index, onProgress)
-  )
-  
-  return Promise.all(compressionPromises)
-}
+export async function compressMultiplePDFs(files, mode, onProgress) {
+  if (!Array.isArray(files) || files.length === 0) {
+    return []
+  }
 
-/**
- * Kompres single PDF menggunakan backend API
- */
-async function compressSinglePDF(file, index, onProgress) {
-  try {
-    // Update status: mulai processing
-    onProgress(index, 0, 'processing', null, null, null)
+  // Normalisasi mode
+  const normalizedMode = mode === 'single' ? 'single' : 'rayon'
+  const pathMode = normalizedMode === 'single' ? 'single' : 'rayon'
+  const url = `${BACKEND_URL}/compress/${pathMode}`
 
-    // Buat FormData untuk upload
-    const formData = new FormData()
+  console.log('compressMultiplePDFs mode =', normalizedMode, 'url =', url)
+
+  // Set awal: semua file masuk status processing (0%)
+  files.forEach((_, index) => {
+    if (typeof onProgress === 'function') {
+      onProgress(index, 0, 'processing', null, null, null)
+    }
+  })
+
+  // Siapkan multipart form untuk semua file
+  const formData = new FormData()
+  files.forEach((file) => {
     formData.append('file', file)
+  })
 
-    // Kirim ke backend
-    const response = await fetch(`${BACKEND_URL}/compress`, {
-      method: 'POST',
-      body: formData,
-    })
+  const response = await fetch(url, {
+    method: 'POST',
+    body: formData,
+  })
 
-    if (!response.ok) {
-      const errorText = await response.text()
-      throw new Error(`Backend error: ${response.status} - ${errorText}`)
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '')
+    throw new Error(`Backend error: ${response.status} - ${errorText}`)
+  }
+
+  const data = await response.json()
+
+  if (!Array.isArray(data)) {
+    throw new Error('Unexpected response format from backend')
+  }
+
+  data.forEach((jobData, index) => {
+    if (index >= files.length) {
+      return
     }
 
-    const data = await response.json()
-
-    if (!data.success) {
-      throw new Error('Compression failed')
-    }
-
-    onProgress(index, 60, 'processing', null, null, null)
-    
-    // Poll untuk status job sampai selesai
-    const jobId = data.jobId
-    const jobData = await pollJobStatus(jobId, index, onProgress)
-    
-    // Format stats dari response backend
     const stats = {
       originalSize: jobData.originalSize,
       compressedSize: jobData.compressedSize,
       reduction: jobData.reductionPercent.toFixed(2),
-      processingTime: jobData.processingTime.toFixed(3)
+      processingTime: jobData.processingTime.toFixed(3),
     }
-    
-    // Update status: selesai
-    onProgress(index, 100, 'completed', stats, jobData.downloadUrl, null)
-    
-    return jobData
 
-  } catch (error) {
-    console.error(`Error compressing ${file.name}:`, error)
-    onProgress(index, 0, 'error', null, null, error.message || 'Gagal mengkompresi file')
-    throw error
-  }
-}
+    if (typeof onProgress === 'function') {
+      onProgress(index, 100, 'completed', stats, jobData.downloadUrl, null)
+    }
+  })
 
-export default {
-  compressMultiplePDFs
+  return data
 }
