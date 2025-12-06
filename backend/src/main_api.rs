@@ -100,8 +100,8 @@ async fn handle_compress_rayon(
     let uploads = collect_uploads(multipart).await?;
     let results = spawn_blocking(move || process_uploads_parallel(uploads))
         .await
-        .map_err(|e| internal_error(format!("Join error: {e}")))?
-        .map_err(internal_error)?;
+        .map_err(|e| internal_error(format!("Join error: {e}")))? // JoinError
+        .map_err(internal_error)?; // String -> (StatusCode, String)
     Ok(Json(results))
 }
 
@@ -111,8 +111,8 @@ async fn handle_compress_single(
     let uploads = collect_uploads(multipart).await?;
     let results = spawn_blocking(move || process_uploads_sequential(uploads))
         .await
-        .map_err(|e| internal_error(format!("Join error: {e}")))?
-        .map_err(internal_error)?;
+        .map_err(|e| internal_error(format!("Join error: {e}")))? // JoinError
+        .map_err(internal_error)?; // String -> (StatusCode, String)
     Ok(Json(results))
 }
 
@@ -193,19 +193,22 @@ fn process_single_upload(
 
     let job_id = Uuid::new_v4().to_string();
 
+    // Tulis file input ke disk (IO)
     let input_path = PathBuf::from(upload_dir).join(&stored_input_name);
     fs::write(&input_path, &file_bytes)
         .map_err(|e| format!("Gagal menulis file input: {e}"))?;
 
+    // Tentukan nama & path file output terkompres
     let compressed_file_name = format!("compressed-{stored_input_name}");
     let output_path = PathBuf::from(compressed_dir).join(&compressed_file_name);
 
+    // Kompres pakai GhostScript (IO + CPU bound)
     let start = Instant::now();
-    // 🔹 Pakai modul gs_compressor, bukan fungsi lokal
     compress_pdf_high(input_path.as_path(), output_path.as_path())
         .map_err(|e| format!("Gagal kompres PDF: {e}"))?;
     let elapsed = start.elapsed().as_secs_f64();
 
+    // Baca ukuran file sebelum & sesudah kompres (IO)
     let original_size = fs::metadata(&input_path)
         .map_err(|e| format!("Gagal baca metadata input: {e}"))?
         .len();
@@ -213,27 +216,52 @@ fn process_single_upload(
         .map_err(|e| format!("Gagal baca metadata output: {e}"))?
         .len();
 
-    let reduction_percent = if original_size == 0 {
+    // Bangun JobStatusResponse pakai helper pure
+    Ok(build_job_status(
+        job_id,
+        original_filename,
+        original_size,
+        compressed_size,
+        elapsed,
+        compressed_file_name,
+    ))
+}
+
+// ==================== FUNGSI PURE HELPER ====================
+
+fn calc_reduction_percent(original_size: u64, compressed_size: u64) -> f64 {
+    if original_size == 0 {
         0.0
     } else {
         (1.0 - (compressed_size as f64 / original_size as f64)) * 100.0
-    };
+    }
+}
 
-    let download_url = format!(
-        "{}/download/{}",
-        BASE_URL, compressed_file_name
-    );
+fn build_download_url(file_name: &str) -> String {
+    format!("{}/download/{}", BASE_URL, file_name)
+}
 
-    Ok(JobStatusResponse {
+fn build_job_status(
+    job_id: String,
+    original_filename: String,
+    original_size: u64,
+    compressed_size: u64,
+    processing_time: f64,
+    compressed_file_name: String,
+) -> JobStatusResponse {
+    let reduction_percent = calc_reduction_percent(original_size, compressed_size);
+    let download_url = build_download_url(&compressed_file_name);
+
+    JobStatusResponse {
         job_id,
         status: "done".to_string(),
         original_filename,
         original_size,
         compressed_size,
         reduction_percent,
-        processing_time: elapsed,
+        processing_time,
         download_url,
-    })
+    }
 }
 
 // ======================== DOWNLOAD ========================
