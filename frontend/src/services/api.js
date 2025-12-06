@@ -3,7 +3,7 @@ const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000'
 console.log('BACKEND_URL =', BACKEND_URL)
 
 /**
- * Kompres multiple PDF dalam satu request.
+ * Kompres multiple PDF dalam satu request dengan simulasi progress visual.
  *
  * @param {File[]} files - Array file PDF
  * @param {'single'|'rayon'} mode - mode kompresi
@@ -28,28 +28,44 @@ export async function compressMultiplePDFs(files, mode, onProgress) {
     }
   })
 
+  // Estimasi waktu kompresi per file (dalam ms) - bisa disesuaikan
+  const estimatedTimePerFile = normalizedMode === 'rayon' ? 3000 : 5000
+  const progressUpdateInterval = 100 // Update progress setiap 100ms
+
+  // Start simulasi progress untuk semua file
+  const progressIntervals = files.map((file, index) => {
+    return startProgressSimulation(index, estimatedTimePerFile, progressUpdateInterval, onProgress)
+  })
+
   // Siapkan multipart form untuk semua file
   const formData = new FormData()
   files.forEach((file) => {
     formData.append('file', file)
   })
 
-  const response = await fetch(url, {
-    method: 'POST',
-    body: formData,
-  })
+  let data
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      body: formData,
+    })
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '')
-    throw new Error(`Backend error: ${response.status} - ${errorText}`)
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => '')
+      throw new Error(`Backend error: ${response.status} - ${errorText}`)
+    }
+
+    data = await response.json()
+
+    if (!Array.isArray(data)) {
+      throw new Error('Unexpected response format from backend')
+    }
+  } finally {
+    // Stop semua simulasi progress
+    progressIntervals.forEach(interval => clearInterval(interval))
   }
 
-  const data = await response.json()
-
-  if (!Array.isArray(data)) {
-    throw new Error('Unexpected response format from backend')
-  }
-
+  // Set progress ke 100% dan update stats
   data.forEach((jobData, index) => {
     if (index >= files.length) {
       return
@@ -68,4 +84,33 @@ export async function compressMultiplePDFs(files, mode, onProgress) {
   })
 
   return data
+}
+
+/**
+ * Simulasi progress yang smooth untuk satu file
+ * @param {number} fileIndex - Index file
+ * @param {number} estimatedTime - Estimasi waktu dalam ms
+ * @param {number} updateInterval - Interval update dalam ms
+ * @param {Function} onProgress - Callback progress
+ * @returns {number} Interval ID
+ */
+function startProgressSimulation(fileIndex, estimatedTime, updateInterval, onProgress) {
+  let currentProgress = 0
+  const incrementPerUpdate = (95 / estimatedTime) * updateInterval // Max 95% saat processing
+  
+  const interval = setInterval(() => {
+    currentProgress += incrementPerUpdate
+    
+    // Cap at 95% - sisanya akan di-set ke 100% saat selesai
+    if (currentProgress >= 95) {
+      currentProgress = 95
+      clearInterval(interval)
+    }
+    
+    if (typeof onProgress === 'function') {
+      onProgress(fileIndex, Math.floor(currentProgress), 'processing', null, null, null)
+    }
+  }, updateInterval)
+  
+  return interval
 }
