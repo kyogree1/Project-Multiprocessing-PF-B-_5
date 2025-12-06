@@ -1,46 +1,34 @@
-use std::{
-    fs,
-    net::SocketAddr,
-    path::PathBuf,
-};
+use std::{fs, net::SocketAddr, path::PathBuf, time::Instant};
 
 use axum::{
-    extract::{Multipart, Path as AxumPath},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath},
+    http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json,
-    Router,
+    Json, Router,
 };
+use rayon::prelude::*;
 use serde::Serialize;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, task::spawn_blocking};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
-use db::connection::get_connection;
-
-mod db;
-
-use db::jobs::{create_job, get_job_by_id};
+// === modul kompresor GhostScript ===
+mod gs_compressor;
+use crate::gs_compressor::compress_pdf_high;
 
 const UPLOAD_DIR: &str = "data/uploads";
 const COMPRESSED_DIR: &str = "data/compressed";
 const BASE_URL: &str = "http://localhost:3000";
-const FRONTEND_URL: &str = "http://localhost:5173";
-
-#[derive(Serialize)]
-struct CreateJobResponse {
-    success: bool,
-    #[serde(rename = "jobId")]
-    job_id: i64,
-    message: String,
-}
 
 #[derive(Serialize)]
 struct JobStatusResponse {
     #[serde(rename = "jobId")]
-    job_id: i64,
+    job_id: String,
+
+    #[serde(rename = "status")]
     status: String,
+
     #[serde(rename = "originalFilename")]
     original_filename: String,
 
@@ -51,21 +39,24 @@ struct JobStatusResponse {
     compressed_size: u64,
 
     #[serde(rename = "reductionPercent")]
-    reduction: f64,
+    reduction_percent: f64,
 
     #[serde(rename = "processingTime")]
     processing_time: f64,
 
     #[serde(rename = "downloadUrl")]
-    download_url: Option<String>,
+    download_url: String,
 }
 
+#[derive(Clone)]
+struct PendingUpload {
+    stored_input_name: String,
+    original_filename: String,
+    file_bytes: Vec<u8>,
+}
 
 #[tokio::main]
 async fn main() {
-    // WAJIB!! Supaya tabel jobs dibuat
-    let _ = get_connection().expect("Failed to init DB");
-
     fs::create_dir_all(UPLOAD_DIR).expect("failed to create upload dir");
     fs::create_dir_all(COMPRESSED_DIR).expect("failed to create compressed dir");
 
@@ -75,9 +66,16 @@ async fn main() {
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/compress", post(handle_compress))
-        .route("/jobs/:id", get(handle_job_status))
+        // 🔹 Fitur multithreading (Rayon)
+        .route("/compress/rayon", post(handle_compress_rayon))
+        // 🔹 Fitur single-thread (sequential)
+        .route("/compress/single", post(handle_compress_single))
+        // (opsional) alias lama /compress → mode Rayon
+        .route("/compress", post(handle_compress_rayon))
+        // Download hasil kompresi
         .route("/download/:file", get(handle_download))
+        // Besarkan limit upload, misal 50MB
+        .layer(DefaultBodyLimit::disable())
         .layer(cors);
 
     let addr: SocketAddr = "0.0.0.0:3000"
@@ -85,18 +83,43 @@ async fn main() {
         .expect("invalid bind address");
 
     println!("API running at {}", BASE_URL);
-    println!("Frontend allowed at {}", FRONTEND_URL);
+    println!("  • POST /compress        (multithreading / Rayon)");
+    println!("  • POST /compress/rayon  (multithreading / Rayon)");
+    println!("  • POST /compress/single (single-thread)");
+    println!("  • GET  /download/:file");
 
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
-// ---------------------- POST /compress -----------------------
 
-async fn handle_compress(
+// ======================== HANDLER ========================
+
+async fn handle_compress_rayon(
+    multipart: Multipart,
+) -> Result<Json<Vec<JobStatusResponse>>, (StatusCode, String)> {
+    let uploads = collect_uploads(multipart).await?;
+    let results = spawn_blocking(move || process_uploads_parallel(uploads))
+        .await
+        .map_err(|e| internal_error(format!("Join error: {e}")))?
+        .map_err(internal_error)?;
+    Ok(Json(results))
+}
+
+async fn handle_compress_single(
+    multipart: Multipart,
+) -> Result<Json<Vec<JobStatusResponse>>, (StatusCode, String)> {
+    let uploads = collect_uploads(multipart).await?;
+    let results = spawn_blocking(move || process_uploads_sequential(uploads))
+        .await
+        .map_err(|e| internal_error(format!("Join error: {e}")))?
+        .map_err(internal_error)?;
+    Ok(Json(results))
+}
+
+async fn collect_uploads(
     mut multipart: Multipart,
-) -> Result<Json<CreateJobResponse>, (StatusCode, String)> {
-    let mut file_name: Option<String> = None;
-    let mut file_bytes: Option<Vec<u8>> = None;
+) -> Result<Vec<PendingUpload>, (StatusCode, String)> {
+    let mut uploads: Vec<PendingUpload> = Vec::new();
 
     while let Some(field) = multipart
         .next_field()
@@ -106,98 +129,114 @@ async fn handle_compress(
         let name = field.file_name().map(|s| s.to_string());
         let data = field.bytes().await.map_err(internal_error)?;
 
-        file_name = name.or(Some("upload.pdf".to_string()));
-        file_bytes = Some(data.to_vec());
-        break;
+        let original_filename = name.unwrap_or_else(|| "upload.pdf".to_string());
+        let id = Uuid::new_v4().to_string();
+        let stored_input_name = format!("{id}-{original_filename}");
+
+        uploads.push(PendingUpload {
+            stored_input_name,
+            original_filename,
+            file_bytes: data.to_vec(),
+        });
     }
 
-    let file_bytes = match file_bytes {
-        Some(b) => b,
-        None => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "No file uploaded".to_string(),
-            ))
-        }
+    if uploads.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No file uploaded".to_string(),
+        ));
+    }
+
+    Ok(uploads)
+}
+
+// ==================== PROSES PARALLEL (RAYON) ====================
+
+fn process_uploads_parallel(
+    uploads: Vec<PendingUpload>,
+) -> Result<Vec<JobStatusResponse>, String> {
+    let upload_dir = UPLOAD_DIR.to_string();
+    let compressed_dir = COMPRESSED_DIR.to_string();
+
+    uploads
+        .into_par_iter()
+        .map(|upload| process_single_upload(upload, &upload_dir, &compressed_dir))
+        .collect()
+}
+
+// ==================== PROSES SEQUENTIAL ====================
+
+fn process_uploads_sequential(
+    uploads: Vec<PendingUpload>,
+) -> Result<Vec<JobStatusResponse>, String> {
+    let upload_dir = UPLOAD_DIR.to_string();
+    let compressed_dir = COMPRESSED_DIR.to_string();
+
+    uploads
+        .into_iter()
+        .map(|upload| process_single_upload(upload, &upload_dir, &compressed_dir))
+        .collect()
+}
+
+// ==================== LOGIKA KOMPREESI SATU FILE ====================
+
+fn process_single_upload(
+    upload: PendingUpload,
+    upload_dir: &str,
+    compressed_dir: &str,
+) -> Result<JobStatusResponse, String> {
+    let PendingUpload {
+        stored_input_name,
+        original_filename,
+        file_bytes,
+    } = upload;
+
+    let job_id = Uuid::new_v4().to_string();
+
+    let input_path = PathBuf::from(upload_dir).join(&stored_input_name);
+    fs::write(&input_path, &file_bytes)
+        .map_err(|e| format!("Gagal menulis file input: {e}"))?;
+
+    let compressed_file_name = format!("compressed-{stored_input_name}");
+    let output_path = PathBuf::from(compressed_dir).join(&compressed_file_name);
+
+    let start = Instant::now();
+    // 🔹 Pakai modul gs_compressor, bukan fungsi lokal
+    compress_pdf_high(input_path.as_path(), output_path.as_path())
+        .map_err(|e| format!("Gagal kompres PDF: {e}"))?;
+    let elapsed = start.elapsed().as_secs_f64();
+
+    let original_size = fs::metadata(&input_path)
+        .map_err(|e| format!("Gagal baca metadata input: {e}"))?
+        .len();
+    let compressed_size = fs::metadata(&output_path)
+        .map_err(|e| format!("Gagal baca metadata output: {e}"))?
+        .len();
+
+    let reduction_percent = if original_size == 0 {
+        0.0
+    } else {
+        (1.0 - (compressed_size as f64 / original_size as f64)) * 100.0
     };
 
-    let original_filename =
-        file_name.unwrap_or_else(|| "upload.pdf".to_string());
+    let download_url = format!(
+        "{}/download/{}",
+        BASE_URL, compressed_file_name
+    );
 
-    let id = Uuid::new_v4().to_string();
-    let stored_input_name = format!("{}-{}", id, &original_filename);
-
-    // path RELATIF untuk disimpan ke DB & Worker
-    let input_path = PathBuf::from(UPLOAD_DIR).join(&stored_input_name);
-
-    fs::write(&input_path, &file_bytes).map_err(internal_error)?;
-
-    let job_id = create_job(
-        &stored_input_name,
-        &input_path.to_string_lossy(),
-    )
-    .map_err(internal_error)?;
-
-    Ok(Json(CreateJobResponse {
-        success: true,
+    Ok(JobStatusResponse {
         job_id,
-        message: "Job created, worker will process it".to_string(),
-    }))
-}
-
-// ---------------------- GET /jobs/:id ------------------------
-
-async fn handle_job_status(
-    AxumPath(id): AxumPath<i64>,
-) -> Result<Json<JobStatusResponse>, (StatusCode, String)> {
-    let job = get_job_by_id(id).map_err(internal_error)?;
-
-    let job = match job {
-        Some(j) => j,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                "Job not found".to_string(),
-            ))
-        }
-    };
-
-    let download_url = job
-        .compressed_path
-        .as_ref()
-        .map(|p| {
-            let file_name = PathBuf::from(p)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            format!("{}/download/{}", BASE_URL, file_name)
-        });
-
-    // RETURN JSON lengkap untuk frontend
-    Ok(Json(JobStatusResponse {
-        job_id: job.id,
-        status: job.status,
-        original_filename: job.original_filename,
-
-        original_size: job.original_size as u64,
-        compressed_size: job.compressed_size as u64,
-        processing_time: job.processing_time,
-
-        reduction: {
-            if job.original_size == 0 {
-                0.0
-            } else {
-                (1.0 - (job.compressed_size as f64 / job.original_size as f64)) * 100.0
-            }
-        },
-
+        status: "done".to_string(),
+        original_filename,
+        original_size,
+        compressed_size,
+        reduction_percent,
+        processing_time: elapsed,
         download_url,
-    }))
+    })
 }
 
-
-// ---------------------- GET /download/:file ------------------
+// ======================== DOWNLOAD ========================
 
 async fn handle_download(
     AxumPath(file): AxumPath<String>,
@@ -213,21 +252,26 @@ async fn handle_download(
 
     let bytes = fs::read(&path).map_err(internal_error)?;
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/pdf"),
+    let dispo = format!(
+        "attachment; filename=\"{}\"",
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
     );
 
-    let dispo = format!("attachment; filename=\"{}\"", file);
-    if let Ok(v) = HeaderValue::from_str(&dispo) {
-        headers.insert(header::CONTENT_DISPOSITION, v);
-    }
+    let headers = [
+        (header::CONTENT_TYPE, HeaderValue::from_static("application/pdf")),
+        (
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_str(&dispo)
+                .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+        ),
+    ];
 
     Ok((headers, bytes))
 }
 
-// ---------------------- Helper error ------------------------
+// ======================== ERROR HELPER ========================
 
 fn internal_error<E: std::fmt::Display>(
     err: E,

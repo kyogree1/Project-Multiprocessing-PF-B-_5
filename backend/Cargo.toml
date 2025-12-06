@@ -7,20 +7,11 @@ edition = "2021"
 name = "main_api"
 path = "src/main_api.rs"
 
-[[bin]]
-name = "worker"
-path = "src/worker.rs"
-
-[[bin]]
-name = "launcher"
-path = "src/launcher.rs"
-
 [dependencies]
-axum = { version = "0.7", features = ["multipart", "json"] } 
+axum = { version = "0.7", features = ["multipart", "json"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-chrono = "0.4"
-rusqlite = { version = "0.30", features = ["bundled"] }
+rayon = "1.10"
