@@ -7,6 +7,10 @@ edition = "2021"
 name = "main_api"
 path = "src/main_api.rs"
 
+[[bin]]
+name = "compress_worker"
+path = "src/worker.rs"
+
 [dependencies]
 axum = { version = "0.7", features = ["multipart", "json"] }
 tower-http = { version = "0.5", features = ["cors"] }

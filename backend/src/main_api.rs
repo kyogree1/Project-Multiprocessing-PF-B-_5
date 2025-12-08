@@ -1,4 +1,5 @@
-use std::{fs, net::SocketAddr, path::PathBuf, time::Instant};
+use std::{fs, net::SocketAddr, path::PathBuf, time::Instant, process::Command};
+use std::path::Path;
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath},
@@ -13,13 +14,15 @@ use tokio::{net::TcpListener, task::spawn_blocking};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
-// === modul kompresor GhostScript ===
-mod gs_compressor;
-use crate::gs_compressor::compress_pdf_high;
 
 const UPLOAD_DIR: &str = "data/uploads";
 const COMPRESSED_DIR: &str = "data/compressed";
 const BASE_URL: &str = "http://localhost:3000";
+#[cfg(target_os = "windows")]
+const WORKER_BIN: &str = "target\\debug\\compress_worker.exe";
+#[cfg(not(target_os = "windows"))]
+const WORKER_BIN: &str = "target/debug/compress_worker";
+
 
 #[derive(Serialize)]
 struct JobStatusResponse {
@@ -204,7 +207,7 @@ fn process_single_upload(
 
     // Kompres pakai GhostScript (IO + CPU bound)
     let start = Instant::now();
-    compress_pdf_high(input_path.as_path(), output_path.as_path())
+    run_worker_process(input_path.as_path(), output_path.as_path())
         .map_err(|e| format!("Gagal kompres PDF: {e}"))?;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -305,4 +308,28 @@ fn internal_error<E: std::fmt::Display>(
     err: E,
 ) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+}
+
+// =========== WORKER PROCESS LAUNCHER (MULTIPROCESSING) ===========
+/// Menjalankan proses worker eksternal (`compress_worker`) sebagai child process.
+
+fn run_worker_process(input: &Path, output: &Path) -> Result<(), String> {
+    let input_str = input
+        .to_str()
+        .ok_or_else(|| "invalid input path".to_string())?;
+    let output_str = output
+        .to_str()
+        .ok_or_else(|| "invalid output path".to_string())?;
+
+    let status = Command::new(WORKER_BIN)
+        .arg(input_str)
+        .arg(output_str)
+        .status()
+        .map_err(|e| format!("Gagal spawn worker process: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Worker exit dengan status: {status}"))
+    }
 }
