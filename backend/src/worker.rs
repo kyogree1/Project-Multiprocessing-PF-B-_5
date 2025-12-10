@@ -15,18 +15,22 @@ use crate::gs_compressor::compress_pdf_high;
 ///      - 0  → kompresi sukses
 ///      - ≠0 → kompresi gagal (akan dibaca sebagai error oleh `main_api`).
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let mut args = env::args().skip(1);
 
-    if args.len() != 3 {
+    let input = args.next().unwrap_or_else(|| {
         eprintln!("Usage: compress_worker <input_path> <output_path>");
         process::exit(1);
-    }
+    });
 
-    let input = PathBuf::from(&args[1]);
-    let output = PathBuf::from(&args[2]);
-
-    if let Err(e) = compress_pdf_high(&input, &output) {
-        eprintln!("Compression failed: {e}");
+    let output = args.next().unwrap_or_else(|| {
+        eprintln!("Usage: compress_worker <input_path> <output_path>");
         process::exit(1);
-    }
+    });
+
+    compress_pdf_high(&PathBuf::from(input), &PathBuf::from(output))
+        .unwrap_or_else(|e| {
+            eprintln!("Compression failed: {e}");
+            process::exit(1);
+        }); 
 }
+    

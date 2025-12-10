@@ -52,20 +52,19 @@ pub fn execute_file_operations(
 fn run_worker_process(input: &Path, output: &Path) -> Result<(), String> {
     let input_str = input
         .to_str()
-        .ok_or_else(|| "invalid input path".to_string())?;
+        .ok_or("invalid input path".to_string())?;
+
     let output_str = output
         .to_str()
-        .ok_or_else(|| "invalid output path".to_string())?;
+        .ok_or("invalid output path".to_string())?;
 
-    let status = Command::new(WORKER_BIN)
+    Command::new(WORKER_BIN)
         .arg(input_str)
         .arg(output_str)
         .status()
-        .map_err(|e| format!("Gagal spawn worker process: {e}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Worker exit dengan status: {status}"))
-    }
+        .map_err(|e| format!("Failed to spawn worker: {e}"))?
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("Worker exited with non-zero status"))
 }
+
