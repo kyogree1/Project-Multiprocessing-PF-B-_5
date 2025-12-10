@@ -1,5 +1,4 @@
-use std::{fs, net::SocketAddr, path::PathBuf, time::Instant, process::Command};
-use std::path::Path;
+use std::{fs, net::SocketAddr, path::PathBuf};
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath},
@@ -14,39 +13,39 @@ use tokio::{net::TcpListener, task::spawn_blocking};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
+mod pure;
+use crate::pure::build_job_status;
 
+mod io_ops;
+use crate::io_ops::execute_file_operations;
+
+// === KONSTANTA ===
 const UPLOAD_DIR: &str = "data/uploads";
 const COMPRESSED_DIR: &str = "data/compressed";
 const BASE_URL: &str = "http://localhost:3000";
+
 #[cfg(target_os = "windows")]
 const WORKER_BIN: &str = "target\\debug\\compress_worker.exe";
 #[cfg(not(target_os = "windows"))]
 const WORKER_BIN: &str = "target/debug/compress_worker";
 
-
+// === STRUCT DATA ===
 #[derive(Serialize)]
 struct JobStatusResponse {
     #[serde(rename = "jobId")]
     job_id: String,
-
     #[serde(rename = "status")]
     status: String,
-
     #[serde(rename = "originalFilename")]
     original_filename: String,
-
     #[serde(rename = "originalSize")]
     original_size: u64,
-
     #[serde(rename = "compressedSize")]
     compressed_size: u64,
-
     #[serde(rename = "reductionPercent")]
     reduction_percent: f64,
-
     #[serde(rename = "processingTime")]
     processing_time: f64,
-
     #[serde(rename = "downloadUrl")]
     download_url: String,
 }
@@ -58,102 +57,120 @@ struct PendingUpload {
     file_bytes: Vec<u8>,
 }
 
-#[tokio::main]
-async fn main() {
+// ======================================================================
+// SETUP SERVER
+// ======================================================================
+
+fn setup_directories() {
     fs::create_dir_all(UPLOAD_DIR).expect("failed to create upload dir");
     fs::create_dir_all(COMPRESSED_DIR).expect("failed to create compressed dir");
+}
 
+fn create_app() -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new()
-        // 🔹 Fitur multithreading (Rayon)
+    Router::new()
         .route("/compress/rayon", post(handle_compress_rayon))
-        // 🔹 Fitur single-thread (sequential)
         .route("/compress/single", post(handle_compress_single))
-        // (opsional) alias lama /compress → mode Rayon
         .route("/compress", post(handle_compress_rayon))
-        // Download hasil kompresi
         .route("/download/:file", get(handle_download))
-        // Besarkan limit upload, misal 50MB
         .layer(DefaultBodyLimit::disable())
-        .layer(cors);
+        .layer(cors)
+}
 
-    let addr: SocketAddr = "0.0.0.0:3000"
-        .parse()
-        .expect("invalid bind address");
-
+async fn run_server(app: Router) {
+    let addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     println!("API running at {}", BASE_URL);
-    println!("  • POST /compress        (multithreading / Rayon)");
-    println!("  • POST /compress/rayon  (multithreading / Rayon)");
-    println!("  • POST /compress/single (single-thread)");
-    println!("  • GET  /download/:file");
 
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-// ======================== HANDLER ========================
+#[tokio::main]
+async fn main() {
+    setup_directories();
+    let app = create_app();
+    run_server(app).await;
+}
+
+// ======================================================================
+// HANDLER
+// ======================================================================
+
+async fn execute_compression_job(
+    uploads: Vec<PendingUpload>,
+    processor: fn(Vec<PendingUpload>) -> Result<Vec<JobStatusResponse>, String>,
+) -> Result<Json<Vec<JobStatusResponse>>, (StatusCode, String)> {
+    let results = spawn_blocking(move || processor(uploads))
+        .await
+        .map_err(|e| internal_error(format!("Join error: {e}")))?
+        .map_err(internal_error)?;
+
+    Ok(Json(results))
+}
 
 async fn handle_compress_rayon(
     multipart: Multipart,
 ) -> Result<Json<Vec<JobStatusResponse>>, (StatusCode, String)> {
     let uploads = collect_uploads(multipart).await?;
-    let results = spawn_blocking(move || process_uploads_parallel(uploads))
-        .await
-        .map_err(|e| internal_error(format!("Join error: {e}")))? // JoinError
-        .map_err(internal_error)?; // String -> (StatusCode, String)
-    Ok(Json(results))
+    execute_compression_job(uploads, process_uploads_parallel).await
 }
 
 async fn handle_compress_single(
     multipart: Multipart,
 ) -> Result<Json<Vec<JobStatusResponse>>, (StatusCode, String)> {
     let uploads = collect_uploads(multipart).await?;
-    let results = spawn_blocking(move || process_uploads_sequential(uploads))
-        .await
-        .map_err(|e| internal_error(format!("Join error: {e}")))? // JoinError
-        .map_err(internal_error)?; // String -> (StatusCode, String)
-    Ok(Json(results))
+    execute_compression_job(uploads, process_uploads_sequential).await
+}
+
+// ======================================================================
+// UPLOAD HANDLING
+// ======================================================================
+
+async fn create_pending_upload(
+    field: axum::extract::multipart::Field<'_>,
+) -> Result<PendingUpload, (StatusCode, String)> {
+    let name = field.file_name().map(|s| s.to_string());
+    let data = field.bytes().await.map_err(internal_error)?;
+
+    let original_filename = name.unwrap_or_else(|| "upload.pdf".to_string());
+    let id = Uuid::new_v4().to_string();
+
+    Ok(PendingUpload {
+        stored_input_name: format!("{id}-{original_filename}"),
+        original_filename,
+        file_bytes: data.to_vec(),
+    })
+}
+
+fn validate_uploads(
+    uploads: Vec<PendingUpload>,
+) -> Result<Vec<PendingUpload>, (StatusCode, String)> {
+    if uploads.is_empty() {
+        Err((StatusCode::BAD_REQUEST, "No file uploaded".into()))
+    } else {
+        Ok(uploads)
+    }
 }
 
 async fn collect_uploads(
     mut multipart: Multipart,
 ) -> Result<Vec<PendingUpload>, (StatusCode, String)> {
-    let mut uploads: Vec<PendingUpload> = Vec::new();
+    let mut uploads = Vec::new();
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(internal_error)?
-    {
-        let name = field.file_name().map(|s| s.to_string());
-        let data = field.bytes().await.map_err(internal_error)?;
-
-        let original_filename = name.unwrap_or_else(|| "upload.pdf".to_string());
-        let id = Uuid::new_v4().to_string();
-        let stored_input_name = format!("{id}-{original_filename}");
-
-        uploads.push(PendingUpload {
-            stored_input_name,
-            original_filename,
-            file_bytes: data.to_vec(),
-        });
+    while let Some(field) = multipart.next_field().await.map_err(internal_error)? {
+        uploads.push(create_pending_upload(field).await?);
     }
 
-    if uploads.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "No file uploaded".to_string(),
-        ));
-    }
-
-    Ok(uploads)
+    validate_uploads(uploads)
 }
 
-// ==================== PROSES PARALLEL (RAYON) ====================
+// ======================================================================
+// PARALLEL / SEQUENTIAL PROCESS
+// ======================================================================
 
 fn process_uploads_parallel(
     uploads: Vec<PendingUpload>,
@@ -163,11 +180,9 @@ fn process_uploads_parallel(
 
     uploads
         .into_par_iter()
-        .map(|upload| process_single_upload(upload, &upload_dir, &compressed_dir))
+        .map(|u| process_single_upload(u, &upload_dir, &compressed_dir))
         .collect()
 }
-
-// ==================== PROSES SEQUENTIAL ====================
 
 fn process_uploads_sequential(
     uploads: Vec<PendingUpload>,
@@ -177,52 +192,28 @@ fn process_uploads_sequential(
 
     uploads
         .into_iter()
-        .map(|upload| process_single_upload(upload, &upload_dir, &compressed_dir))
+        .map(|u| process_single_upload(u, &upload_dir, &compressed_dir))
         .collect()
 }
-
-// ==================== LOGIKA KOMPREESI SATU FILE ====================
 
 fn process_single_upload(
     upload: PendingUpload,
     upload_dir: &str,
     compressed_dir: &str,
 ) -> Result<JobStatusResponse, String> {
-    let PendingUpload {
-        stored_input_name,
-        original_filename,
-        file_bytes,
-    } = upload;
-
     let job_id = Uuid::new_v4().to_string();
 
-    // Tulis file input ke disk (IO)
-    let input_path = PathBuf::from(upload_dir).join(&stored_input_name);
-    fs::write(&input_path, &file_bytes)
-        .map_err(|e| format!("Gagal menulis file input: {e}"))?;
+    let PendingUpload { ref original_filename, .. } = upload;
 
-    // Tentukan nama & path file output terkompres
-    let compressed_file_name = format!("compressed-{stored_input_name}");
-    let output_path = PathBuf::from(compressed_dir).join(&compressed_file_name);
+    let (original_size, compressed_size, elapsed, output_path) =
+        execute_file_operations(&upload, upload_dir, compressed_dir)?;
 
-    // Kompres pakai GhostScript (IO + CPU bound)
-    let start = Instant::now();
-    run_worker_process(input_path.as_path(), output_path.as_path())
-        .map_err(|e| format!("Gagal kompres PDF: {e}"))?;
-    let elapsed = start.elapsed().as_secs_f64();
+    let compressed_file_name =
+        output_path.file_name().unwrap().to_string_lossy().to_string();
 
-    // Baca ukuran file sebelum & sesudah kompres (IO)
-    let original_size = fs::metadata(&input_path)
-        .map_err(|e| format!("Gagal baca metadata input: {e}"))?
-        .len();
-    let compressed_size = fs::metadata(&output_path)
-        .map_err(|e| format!("Gagal baca metadata output: {e}"))?
-        .len();
-
-    // Bangun JobStatusResponse pakai helper pure
     Ok(build_job_status(
         job_id,
-        original_filename,
+        original_filename.clone(),
         original_size,
         compressed_size,
         elapsed,
@@ -230,44 +221,9 @@ fn process_single_upload(
     ))
 }
 
-// ==================== FUNGSI PURE HELPER ====================
-
-fn calc_reduction_percent(original_size: u64, compressed_size: u64) -> f64 {
-    if original_size == 0 {
-        0.0
-    } else {
-        (1.0 - (compressed_size as f64 / original_size as f64)) * 100.0
-    }
-}
-
-fn build_download_url(file_name: &str) -> String {
-    format!("{}/download/{}", BASE_URL, file_name)
-}
-
-fn build_job_status(
-    job_id: String,
-    original_filename: String,
-    original_size: u64,
-    compressed_size: u64,
-    processing_time: f64,
-    compressed_file_name: String,
-) -> JobStatusResponse {
-    let reduction_percent = calc_reduction_percent(original_size, compressed_size);
-    let download_url = build_download_url(&compressed_file_name);
-
-    JobStatusResponse {
-        job_id,
-        status: "done".to_string(),
-        original_filename,
-        original_size,
-        compressed_size,
-        reduction_percent,
-        processing_time,
-        download_url,
-    }
-}
-
-// ======================== DOWNLOAD ========================
+// ======================================================================
+// DOWNLOAD & ERROR
+// ======================================================================
 
 async fn handle_download(
     AxumPath(file): AxumPath<String>,
@@ -275,61 +231,28 @@ async fn handle_download(
     let path = PathBuf::from(COMPRESSED_DIR).join(&file);
 
     if !path.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "File not found".to_string(),
-        ));
+        return Err((StatusCode::NOT_FOUND, "File not found".into()));
     }
 
     let bytes = fs::read(&path).map_err(internal_error)?;
 
     let dispo = format!(
         "attachment; filename=\"{}\"",
-        path.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
+        path.file_name().unwrap().to_string_lossy()
     );
 
-    let headers = [
-        (header::CONTENT_TYPE, HeaderValue::from_static("application/pdf")),
-        (
-            header::CONTENT_DISPOSITION,
-            HeaderValue::from_str(&dispo)
-                .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
-        ),
-    ];
-
-    Ok((headers, bytes))
+    Ok((
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("application/pdf")),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&dispo).unwrap(),
+            ),
+        ],
+        bytes,
+    ))
 }
 
-// ======================== ERROR HELPER ========================
-
-fn internal_error<E: std::fmt::Display>(
-    err: E,
-) -> (StatusCode, String) {
+fn internal_error<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-}
-
-// =========== WORKER PROCESS LAUNCHER (MULTIPROCESSING) ===========
-/// Menjalankan proses worker eksternal (`compress_worker`) sebagai child process.
-
-fn run_worker_process(input: &Path, output: &Path) -> Result<(), String> {
-    let input_str = input
-        .to_str()
-        .ok_or_else(|| "invalid input path".to_string())?;
-    let output_str = output
-        .to_str()
-        .ok_or_else(|| "invalid output path".to_string())?;
-
-    let status = Command::new(WORKER_BIN)
-        .arg(input_str)
-        .arg(output_str)
-        .status()
-        .map_err(|e| format!("Gagal spawn worker process: {e}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Worker exit dengan status: {status}"))
-    }
 }

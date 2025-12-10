@@ -17,8 +17,8 @@
             v-model="mode"
             class="border border-slate-300 rounded-md px-2 py-1 text-sm bg-white"
           >
-            <option value="rayon">Multi-thread (Rayon)</option>
-            <option value="single">Single-thread</option>
+            <option value="rayon">MultiProcessing</option>
+            <option value="single">SingleProcessing</option>
           </select>
         </label>
       </div>
